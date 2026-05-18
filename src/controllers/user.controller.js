@@ -2,6 +2,8 @@ const db     = require('../config/db');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const path   = require('path');
+const fs     = require('fs');
+const axios  = require('axios');
 const { success, error } = require('../utils/response');
 
 const avatarStorage = multer.diskStorage({
@@ -15,13 +17,16 @@ exports.getProfile = async (req, res) => {
   try {
     const [rows] = await db.execute(
       `SELECT u.id, u.name, u.email, u.phone, u.role, u.store_id, u.employee_code,
-       u.designation, u.joining_date, u.avatar, u.status,
+       u.designation, u.joining_date, u.avatar, u.status, u.face_photo,
        s.name as store_name, s.store_code
        FROM users u LEFT JOIN stores s ON s.id = u.store_id WHERE u.id = ?`,
       [req.user.id]
     );
     const user = rows[0];
-    if (user.avatar) user.avatar = `${process.env.BASE_URL}/storage/${user.avatar}`;
+    if (user.avatar)     user.avatar     = `${process.env.BASE_URL}/storage/${user.avatar}`;
+    if (user.face_photo) user.face_photo = `${process.env.BASE_URL}/storage/${user.face_photo}`;
+    // Tell the app whether a face is registered so it can show/hide warnings
+    user.has_face_registered = !!rows[0].face_photo;
     return success(res, { user });
   } catch (err) {
     return error(res, 'Server error', 500);
@@ -35,7 +40,7 @@ exports.updateProfile = async (req, res) => {
     const updates = [];
     const params = [];
 
-    if (name) { updates.push('name = ?'); params.push(name); }
+    if (name)  { updates.push('name = ?');  params.push(name); }
     if (phone) { updates.push('phone = ?'); params.push(phone); }
     if (req.file) {
       updates.push('avatar = ?');
@@ -48,6 +53,69 @@ exports.updateProfile = async (req, res) => {
     await db.execute(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
     return success(res, null, 'Profile updated successfully');
   } catch (err) {
+    return error(res, 'Server error', 500);
+  }
+};
+
+// Register / update face photo
+// Accepts base64 image string in req.body.face_photo
+// Mirrors Laravel's registerFacePhoto(): saves file → calls Python /register → updates DB
+exports.registerFacePhoto = async (req, res) => {
+  try {
+    const { face_photo } = req.body; // base64 string like "data:image/jpeg;base64,..."
+    const userId = req.user.id;
+
+    if (!face_photo) return error(res, 'face_photo is required', 422);
+
+    // 1. Save the image file (same path pattern as Laravel: face_photos/user_{id}_{ts}.jpg)
+    const base64Data = face_photo.replace(/^data:image\/\w+;base64,/, '');
+    const dir      = path.join(process.env.UPLOAD_PATH, 'face_photos');
+    fs.mkdirSync(dir, { recursive: true });
+    const filename  = `user_${userId}_${Date.now()}.jpg`;
+    const filePath  = path.join(dir, filename);
+    fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
+    const photoPath = `face_photos/${filename}`;
+
+    // 2. Call Python face service /register (matches Laravel FaceRecognitionService::register)
+    const faceUrl = (process.env.FACE_SERVICE_URL || 'http://127.0.0.1:5001').replace(/\/$/, '');
+    const secret  = process.env.FACE_SERVICE_SECRET || 'change_me_in_production';
+
+    try {
+      // Send as base64 — Python service accepts both file and base64
+      const resp = await axios.post(
+        `${faceUrl}/register`,
+        { user_id: userId, face_photo: face_photo },
+        { headers: { 'X-Face-Secret': secret }, timeout: 15000 }
+      );
+
+      if (!resp.data?.success) {
+        // Clean up saved file on failure
+        try { fs.unlinkSync(filePath); } catch (_) {}
+        return error(res, resp.data?.message || 'Face registration failed', 422);
+      }
+    } catch (faceErr) {
+      // If face service is down, still save the photo (admin-registered style)
+      // Don't block the employee — the check-in will fail anyway if face service is down
+      console.error('Face service unavailable during registration:', faceErr.message);
+    }
+
+    // 3. Remove old face photo file if exists
+    const [existing] = await db.execute('SELECT face_photo FROM users WHERE id = ?', [userId]);
+    const oldPhoto = existing[0]?.face_photo;
+    if (oldPhoto) {
+      const oldPath = path.join(process.env.UPLOAD_PATH, oldPhoto.replace('face_photos/', 'face_photos/'));
+      try { fs.unlinkSync(oldPath); } catch (_) {}
+    }
+
+    // 4. Update DB
+    await db.execute(
+      'UPDATE users SET face_photo = ?, updated_at = NOW() WHERE id = ?',
+      [photoPath, userId]
+    );
+
+    return success(res, { has_face_registered: true }, 'Face photo registered successfully');
+  } catch (err) {
+    console.error('registerFacePhoto error:', err);
     return error(res, 'Server error', 500);
   }
 };

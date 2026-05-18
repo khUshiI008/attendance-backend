@@ -8,11 +8,12 @@ const auth = async (req, res, next) => {
     if (!header || !header.startsWith('Bearer ')) {
       return error(res, 'No token provided', 401);
     }
-    const token = header.split(' ')[1];
+    const token   = header.split(' ')[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
+    // Include face_photo — needed by checkIn to verify face is registered
     const [rows] = await db.execute(
-      'SELECT id, name, email, role, store_id, status, avatar, employee_code, designation FROM users WHERE id = ?',
+      'SELECT id, name, email, role, store_id, status, avatar, face_photo, employee_code, designation FROM users WHERE id = ?',
       [decoded.id]
     );
     if (!rows.length || rows[0].status !== 'active') {
